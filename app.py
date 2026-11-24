@@ -126,44 +126,41 @@ pts = alt.Chart(priced).mark_circle(size=90, stroke="white", strokeWidth=0.8).en
 ).add_params(brush, pick)
 # frontier labels: shorten model ids, then place each label greedily where it hits the fewest points/labels
 LABEL_SPOTS = [("left", 8, 4), ("left", 8, -9), ("right", -8, -7), ("right", -8, 8), ("center", 0, -13), ("center", 0, 15)]
-PW, PH = 720, 430
-
-
-def _px(cost, pct):
-    return (np.log10(cost) - np.log10(0.1)) / (np.log10(300) - np.log10(0.1)) * PW, (1 - pct / 100) * PH
-
-
-def place_labels(df: pd.DataFrame) -> pd.DataFrame:
-    pts_px = [_px(c, v) for c, v in zip(df["total_cost"], df["pass_rate_2"])]
-    boxes, rows = [], []
-    for _, r in df[df["pareto"]].sort_values("total_cost").iterrows():
-        x, y = _px(r.total_cost, r.pass_rate_2)
-        w = 5.4 * len(r.short) + 2
+def place_labels(df, mask, text, x="total_cost", y="pass_rate_2", xdom=(0.1, 300), ydom=(0, 100), W=720, H=430):
+    """Greedy label placement: for each labelled point pick the spot that hits the fewest points/labels."""
+    def px(c, v):
+        return ((np.log10(c) - np.log10(xdom[0])) / (np.log10(xdom[1]) - np.log10(xdom[0])) * W,
+                (1 - (v - ydom[0]) / (ydom[1] - ydom[0])) * H)
+    pts_px = [px(c, v) for c, v in zip(df[x], df[y])]
+    boxes, out = [], pd.Series(-1, index=df.index)
+    for idx, r in df[mask].sort_values(x).iterrows():
+        cx, cy = px(r[x], r[y])
+        w = 5.4 * len(r[text]) + 2
         best = None
         for k, (al, dx, dy) in enumerate(LABEL_SPOTS):
-            x0 = x + dx if al == "left" else (x + dx - w if al == "right" else x - w / 2)
-            b = (x0, y + dy - 6, x0 + w, y + dy + 6)
-            hit = sum(b[0] - 5 < px < b[2] + 5 and b[1] - 5 < py < b[3] + 5 for px, py in pts_px if (px, py) != (x, y))
+            x0 = cx + dx if al == "left" else (cx + dx - w if al == "right" else cx - w / 2)
+            b = (x0, cy + dy - 6, x0 + w, cy + dy + 6)
+            hit = sum(b[0] - 5 < qx < b[2] + 5 and b[1] - 5 < qy < b[3] + 5 for qx, qy in pts_px if (qx, qy) != (cx, cy))
             hit += 10 * sum(not (b[2] < o[0] or o[2] < b[0] or b[3] < o[1] or o[3] < b[1]) for o in boxes)
-            hit += 10 * (b[0] < 0 or b[2] > PW or b[1] < 0 or b[3] > PH)
+            hit += 10 * (b[0] < 0 or b[2] > W or b[1] < 0 or b[3] > H)
             if best is None or hit < best[0]:
                 best = (hit, k, b)
         boxes.append(best[2])
-        rows.append((r.name, best[1]))
-    out = df.copy()
-    out["lpos"] = -1
-    for idx, k in rows:
-        out.loc[idx, "lpos"] = k
+        out[idx] = best[1]
     return out
 
 
-priced["short"] = priced["model"].str.replace(r"-20\d{2}-?\d{2}-?\d{2}", "", regex=True)
-priced = place_labels(priced)
-base = alt.Chart(priced)
-labels = alt.layer(*[
-    base.transform_filter(f"datum.lpos == {k}").mark_text(align=al, dx=dx, dy=dy, fontSize=10, color="#52514e").encode(x=X, y=Y, text="short:N")
-    for k, (al, dx, dy) in enumerate(LABEL_SPOTS)
-])
+def label_layers(data, text, x, y):
+    return alt.layer(*[
+        alt.Chart(data).transform_filter(f"datum.lpos == {k}").mark_text(align=al, dx=dx, dy=dy, fontSize=10, color="#52514e").encode(x=x, y=y, text=f"{text}:N")
+        for k, (al, dx, dy) in enumerate(LABEL_SPOTS)
+    ])
+
+
+DATE_RE = r"-20\d{2}-?\d{2}-?\d{2}"
+priced["short"] = priced["model"].str.replace(DATE_RE, "", regex=True)
+priced["lpos"] = place_labels(priced, priced["pareto"], "short")
+labels = label_layers(priced, "short", X, Y)
 v1 = (frontier_line + pts + labels).properties(width=720, height=430, title="V1 · Accuracy vs. cost (blue step line = frontier: no run is both cheaper and more accurate)")
 
 unknown = view[~view["cost_known"]].assign(jit=lambda d: np.random.default_rng(1).uniform(-1, 1, len(d)))
@@ -221,14 +218,16 @@ with left:
         multi = fam["family"].value_counts()
         fam = fam[fam["family"].isin(multi[multi > 1].index)]
         fam["selected"] = fam["family"].isin(shortlist["family"])
-        fx = alt.X("total_cost:Q", scale=alt.Scale(type="log"), title="Run cost ($, log)", axis=alt.Axis(format="$,.2~f"))
-        fy = alt.Y("pass_rate_2:Q", title="% solved", scale=alt.Scale(zero=False))
+        fam["flabel"] = fam["family"].str.replace(DATE_RE, "", regex=True)
+        _top = fam.groupby("family")["total_cost"].transform("max") == fam["total_cost"]
+        fam["lpos"] = place_labels(fam, _top, "flabel", xdom=(0.1, 300), ydom=(20, 100), W=600, H=280)
+        fx = alt.X("total_cost:Q", scale=alt.Scale(type="log", domain=[0.1, 300]), title="Run cost ($, log)", axis=alt.Axis(format="$,.2~f"))
+        fy = alt.Y("pass_rate_2:Q", title="% solved", scale=alt.Scale(domain=[20, 100]))
         lines = alt.Chart(fam).mark_line(point=True, strokeWidth=1.6).encode(
             x=fx, y=fy, detail="family:N", order="total_cost:Q", color=sel_color,
             tooltip=[alt.Tooltip("model:N", title="Model"), alt.Tooltip("pass_rate_2:Q", format=".1f", title="% solved"),
                      alt.Tooltip("total_cost:Q", format="$,.2f", title="Run cost")])
-        ends = alt.Chart(fam).transform_window(rank="rank()", groupby=["family"], sort=[alt.SortField("total_cost", order="descending")]) \
-            .transform_filter("datum.rank == 1").mark_text(align="left", dx=6, fontSize=10, color="#52514e").encode(x=fx, y=fy, text="family:N")
+        ends = label_layers(fam, "flabel", fx, fy)
         st.altair_chart((lines + ends).properties(height=330, title="Same model, more reasoning: what does each step cost?"), use_container_width=True)
         st.caption(f"{fam['family'].nunique()} model families with more than one priced configuration. Families in your selection are blue.")
     with t2:
